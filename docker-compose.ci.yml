@@ -1,0 +1,53 @@
+# ============================================================
+# FlowAI Studio — CI 测试环境 Docker Compose
+# ============================================================
+# 用法:
+#   docker compose -f docker-compose.ci.yml up -d
+#   启动 PostgreSQL + Redis 供本地测试用
+#
+#   然后运行测试:
+#   cd flowai-studio-backend && npx jest --config ./test/jest-e2e.json
+#   cd flowai-studio-frontend && npx playwright test
+# ============================================================
+
+services:
+  # ============================================================
+  # PostgreSQL + pgvector — 主数据库 + 向量存储
+  # ============================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: flowai-ci-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: flowai_studio
+    ports:
+      - "5432:5432"
+    volumes:
+      - ci_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-pgvector.sql:/docker-entrypoint-initdb.d/init-pgvector.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flowai_studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============================================================
+  # Redis — 缓存 + 限流
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: flowai-ci-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ci_postgres_data:
+    driver: local

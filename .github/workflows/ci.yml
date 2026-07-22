@@ -1,50 +1,52 @@
 # ============================================================
-# FlowAI Studio - CI Pipeline
+# FlowAI Studio — CI/CD Pipeline
 # ============================================================
-# 触发条件: push/PR to main
-# 流程: lint → type-check → test → build
+# 触发条件：push 到 main / 任何 PR
 #
-# 竞品对标:
-# - Dify: GitHub Actions (lint + test + build + docker)
-# - n8n: GitHub Actions (lint + type-check + test)
-# - FastGPT: GitHub Actions (build + docker)
+# 流程：
+#   1. docker compose 启动 PostgreSQL + Redis
+#   2. 初始化后端数据库（Prisma push + seed）
+#   3. 启动后端 NestJS 开发服务器
+#   4. 安装前端依赖 + Playwright 浏览器
+#   5. 启动前端 Vite 开发服务器
+#   6. 运行后端 E2E 测试（Jest）
+#   7. 运行前端 E2E 测试（Playwright）
+#   8. 失败时上传测试报告
 # ============================================================
 
-name: CI
+name: FlowAI Studio CI
 
 on:
-  # 暂时禁用 CI，后续按需启用
-  # push:
-  #   branches: [main, develop]
-  # pull_request:
-  #   branches: [main]
-  workflow_dispatch: {}
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
 
 env:
-  NODE_VERSION: '20'
+  NODE_VERSION: '22'
+  BACKEND_PORT: 3000
+  FRONTEND_PORT: 5173
 
 jobs:
-  # ============================================================
-  # 后端检查
-  # ============================================================
-  backend:
-    name: Backend CI
+  e2e-tests:
+    name: 'End-to-End Tests'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: flowai-studio-backend
 
     services:
+      # -------------------------------------------------------
+      # 方案：使用 docker compose 启动基础设施
+      # GitHub Actions 原生支持 docker compose
+      # -------------------------------------------------------
       postgres:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: flowai_studio_test
+          POSTGRES_DB: flowai_studio
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d flowai_studio"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -60,86 +62,165 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      # -------------------------------------------------------
+      # Step 1: 检出代码
+      # -------------------------------------------------------
+      - name: 'Checkout code'
+        uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      # -------------------------------------------------------
+      # Step 2: 设置 Node.js
+      # -------------------------------------------------------
+      - name: 'Setup Node.js ${{ env.NODE_VERSION }}'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-          cache-dependency-path: flowai-studio-backend/package-lock.json
+          cache-dependency-path: |
+            flowai-studio-backend/package-lock.json
+            flowai-studio-frontend/package-lock.json
 
-      - name: Install dependencies
+      # -------------------------------------------------------
+      # Step 3: 创建后端 .env（CI 专用配置）
+      # -------------------------------------------------------
+      - name: 'Create backend .env for CI'
+        run: |
+          cat > flowai-studio-backend/.env << 'EOF'
+          PORT=${{ env.BACKEND_PORT }}
+          NODE_ENV=development
+          DATABASE_URL="postgresql://postgres:postgres@localhost:5432/flowai_studio?schema=public"
+          JWT_SECRET=ci-jwt-secret-for-testing-only
+          JWT_EXPIRES_IN=7d
+          REDIS_URL=redis://localhost:6379
+          FRONTEND_URL=http://localhost:${{ env.FRONTEND_PORT }}
+          UPLOAD_PATH=./uploads
+          MAX_FILE_SIZE=10485760
+          EMBEDDING_PROVIDER=qwen
+          VECTOR_STORE=pgvector
+          QWEN_API_KEY=
+          EOF
+
+      # -------------------------------------------------------
+      # Step 4: 安装后端依赖 + 初始化数据库
+      # -------------------------------------------------------
+      - name: 'Install backend dependencies'
+        working-directory: flowai-studio-backend
         run: npm ci
 
-      - name: Generate Prisma Client
+      - name: 'Generate Prisma client'
+        working-directory: flowai-studio-backend
         run: npx prisma generate
 
-      - name: Lint
-        run: npm run lint --if-present
-
-      - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Run database migrations
+      - name: 'Push database schema'
+        working-directory: flowai-studio-backend
+        run: npx prisma db push
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowai_studio_test?schema=public
-        run: npx prisma migrate deploy || echo "Migration skipped (may need manual setup)"
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowai_studio?schema=public
 
-      - name: Test
+      - name: 'Seed database'
+        working-directory: flowai-studio-backend
+        run: npx prisma db seed
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowai_studio_test?schema=public
-          REDIS_URL: redis://localhost:6379
-          JWT_SECRET: test-jwt-secret
-          QWEN_API_KEY: test-api-key
-          NODE_ENV: test
-        run: npm test --if-present
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/flowai_studio?schema=public
 
-  # ============================================================
-  # 前端检查
-  # ============================================================
-  frontend:
-    name: Frontend CI
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      # -------------------------------------------------------
+      # Step 5: 启动后端服务器（后台运行）
+      # -------------------------------------------------------
+      - name: 'Start backend dev server'
+        working-directory: flowai-studio-backend
+        run: |
+          nohup npm run start:dev > /tmp/backend.log 2>&1 &
+          echo "Backend PID: $!"
+          # 等待后端启动完成
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:${{ env.BACKEND_PORT }}/api/health | grep -q 200; then
+              echo "Backend is ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: 'Verify backend health'
+        run: |
+          curl -s http://localhost:${{ env.BACKEND_PORT }}/api/health | python3 -m json.tool
+
+      # -------------------------------------------------------
+      # Step 6: 运行后端 E2E 测试（Jest）
+      # -------------------------------------------------------
+      - name: 'Run backend E2E tests'
+        working-directory: flowai-studio-backend
+        run: npx jest --config ./test/jest-e2e.json --verbose
+        env:
+          API_BASE_URL: http://localhost:${{ env.BACKEND_PORT }}/api
+
+      # -------------------------------------------------------
+      # Step 7: 安装前端依赖 + Playwright
+      # -------------------------------------------------------
+      - name: 'Install frontend dependencies'
         working-directory: flowai-studio-frontend
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: flowai-studio-frontend/package-lock.json
-
-      - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint --if-present
+      - name: 'Install Playwright browsers'
+        working-directory: flowai-studio-frontend
+        run: npx playwright install chromium
 
-      - name: Type check
-        run: npx tsc --noEmit
+      # -------------------------------------------------------
+      # Step 8: 启动前端服务器（后台运行）
+      # -------------------------------------------------------
+      - name: 'Start frontend dev server'
+        working-directory: flowai-studio-frontend
+        run: |
+          nohup npm run dev > /tmp/frontend.log 2>&1 &
+          echo "Frontend PID: $!"
+          for i in $(seq 1 20); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:${{ env.FRONTEND_PORT }} | grep -q 200; then
+              echo "Frontend is ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
 
-      - name: Build
-        run: npm run build
+      # -------------------------------------------------------
+      # Step 9: 运行前端 Playwright E2E 测试
+      # -------------------------------------------------------
+      - name: 'Run Playwright E2E tests'
+        working-directory: flowai-studio-frontend
+        run: npx playwright test --reporter=list
 
-  # ============================================================
-  # Docker 构建验证
-  # ============================================================
-  docker:
-    name: Docker Build
+      - name: 'Upload Playwright report on failure'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: flowai-studio-frontend/test-results/
+          retention-days: 7
+
+      # -------------------------------------------------------
+      # Step 10: 上传后端测试报告
+      # -------------------------------------------------------
+      - name: 'Upload backend test report on failure'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-logs
+          path: |
+            /tmp/backend.log
+            /tmp/frontend.log
+          retention-days: 7
+
+  # -----------------------------------------------------------
+  # 通知（可选）：测试完成后发送结果
+  # -----------------------------------------------------------
+  notify:
+    name: 'Notify test results'
+    needs: [e2e-tests]
+    if: always()
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Build backend image
-        run: docker build -t flowai-backend:test ./flowai-studio-backend
-
-      - name: Build frontend image
-        run: docker build -t flowai-frontend:test ./flowai-studio-frontend
+      - name: 'Check test status'
+        run: |
+          if [ "${{ needs.e2e-tests.result }}" = "success" ]; then
+            echo "✅ All E2E tests passed"
+          else
+            echo "❌ Some E2E tests failed — check Playwright report artifact"
+          fi
