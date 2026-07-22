@@ -59,24 +59,56 @@ export class WorkflowExecutorService {
     const cancelToken = { cancelled: false };
     this.cancelTokens.set(execId, cancelToken);
 
+    // 从数据库读出 nodes 和 edges
     const nodes = JSON.parse(workflow.nodes) as any[];
     const edges = JSON.parse(workflow.edges) as any[];
 
-    // Build adjacency: nodeId → [{target, sourceHandle}]
+    // 记录"每个节点指向谁"  nodeId → [{target, sourceHandle}]
     const adjList = new Map<string, { target: string; sourceHandle?: string }[]>();
-    // Build in-degree map (only non-condition-dependent)
+    // 记录"每个节点被几个前置节点指"
     const inDegree = new Map<string, number>();
 
     for (const node of nodes) {
-      adjList.set(node.id, []);
-      inDegree.set(node.id, 0);
+      adjList.set(node.id, []); // 邻接表里放空数组
+      inDegree.set(node.id, 0); // 入度初始为 0
     }
 
+    /**
+     * 举个具体例子，假设你画了这样一个工作流：
+     *
+     *    start ──▶ rag ──▶ condition ─┬─▶ 输出true
+     *                                └─▶ 输出false
+     *
+     *  跑完上面这段代码后，内存里的两个表长这样：
+     *
+     * ```javascript
+     *     // adjList: 谁指向谁
+     *     start     → [{ target: "rag", sourceHandle: undefined }]
+     *     rag       → [{ target: "condition", sourceHandle: undefined }]
+     *     condition → [
+     *       { target: "输出true",  sourceHandle: "true"  },
+     *       { target: "输出false", sourceHandle: "false" },
+     *     ]
+     *     输出true  → []
+     *     输出false → []
+     *
+     *     // inDegree: 每个节点有几个前置节点
+     *     start     → 0   ✅ 没有箭头指它
+     *     rag       → 1   （start → rag）
+     *     condition → 1   （rag → condition）
+     *     输出true  → 1   （condition → 输出true）
+     *     输出false → 1   （condition → 输出false）
+     * ```
+     */
+
+    // 遍历每条边，填充两个表
     for (const edge of edges) {
       const neighbors = adjList.get(edge.source);
       if (neighbors) {
+        // ① 在邻接表里加一条："source 指向 target"
         neighbors.push({ target: edge.target, sourceHandle: edge.sourceHandle });
       }
+      // ② target 的入度 +1（被多一条边指着）
       inDegree.set(edge.target, (inDegree.get(edge.target) || 0) + 1);
     }
 
