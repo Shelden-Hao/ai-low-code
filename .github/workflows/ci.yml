@@ -101,11 +101,22 @@ jobs:
           EOF
 
       # -------------------------------------------------------
-      # Step 4: 安装后端依赖 + 初始化数据库
+      # Step 4: 安装后端依赖 + 启用 pgvector + 初始化数据库
       # -------------------------------------------------------
       - name: 'Install backend dependencies'
         working-directory: flowai-studio-backend
         run: npm ci
+
+      - name: 'Enable pgvector extension'
+        run: |
+          # GitHub Actions services 不会自动执行 init-pgvector.sql，
+          # 需要在 prisma db push 之前手动启用 vector 扩展
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+          PGPASSWORD=postgres psql -h localhost -U postgres -d flowai_studio \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+            -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+          echo "pgvector extension enabled"
 
       - name: 'Generate Prisma client'
         working-directory: flowai-studio-backend
