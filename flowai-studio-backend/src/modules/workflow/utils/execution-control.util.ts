@@ -3,6 +3,18 @@
  *
  * Phase 4.1: 超时控制与心跳检测
  *
+ * 节点级超时 (nodeTimeoutMs)：每个节点单独的超时控制，默认 60 秒
+ * 工作流整体超时 (workflowTimeoutMs)：整个流程的总超时，默认 5 分钟
+ * 两个超时配合使用，确保不会因为一个 LLM 调用卡死整个流程
+ *
+ * ```js
+ * // 节点级（在 BFS 循环内部）
+ * await withTimeout(executor.execute(node, context), control.nodeTimeoutMs, 'node', nodeId);
+ *
+ * // 工作流级（包裹整个 BFS 循环）
+ * await withTimeout(runLoop(), control.workflowTimeoutMs, 'workflow', workflow.name);
+ * ```
+ *
  * 提供:
  * - withTimeout: 为 Promise 添加超时控制
  * - retryWithBackoff: 指数退避重试
@@ -15,25 +27,25 @@
  * - Coze: 仅有整体超时
  * - 本设计: 节点级+工作流级双重超时 + 心跳保活 + 指数退避重试 + 进度上报
  */
-import { Subject } from 'rxjs';
+import { Subject } from "rxjs";
 
 /** 超时错误 */
 export class TimeoutError extends Error {
   constructor(
     message: string,
     public readonly timeoutMs: number,
-    public readonly scope: 'node' | 'workflow',
+    public readonly scope: "node" | "workflow",
   ) {
     super(message);
-    this.name = 'TimeoutError';
+    this.name = "TimeoutError";
   }
 }
 
 /** 取消错误（工作流被主动取消） */
 export class CancelledError extends Error {
-  constructor(message = 'Execution cancelled') {
+  constructor(message = "Execution cancelled") {
     super(message);
-    this.name = 'CancelledError';
+    this.name = "CancelledError";
   }
 }
 
@@ -48,7 +60,7 @@ export class CancelledError extends Error {
 export async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
-  scope: 'node' | 'workflow',
+  scope: "node" | "workflow",
   label?: string,
 ): Promise<T> {
   if (!timeoutMs || timeoutMs <= 0) {
@@ -104,7 +116,12 @@ export const DEFAULT_RETRY_OPTIONS: RetryOptions = {
     if (error instanceof CancelledError) return false;
     if (error instanceof TimeoutError) return true;
     // 网络相关错误码
-    const retryableCodes = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND'];
+    const retryableCodes = [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+      "ENOTFOUND",
+    ];
     if (error?.code && retryableCodes.includes(error.code)) return true;
     // HTTP 5xx 或 429 限流
     const status = error?.response?.status;
@@ -118,11 +135,29 @@ export const DEFAULT_RETRY_OPTIONS: RetryOptions = {
  *
  * @param fn 要执行的异步函数
  * @param options 重试选项
+ * @example
+ * retryWithBackoff(fn, {
+ *   maxRetries: control.maxRetries,
+ *   onRetry: (attempt, error, delayMs) => {
+ *     sseSubject?.next({
+ *       type: 'node_status',
+ *       data: {
+ *         nodeId,
+ *         status: 'retrying',  // 前端可以显示"正在重试"
+ *         attempt,              // 第几次重试
+ *         delayMs,              // 本次等待时间
+ *         error: error.message  // 错误原因
+ *       },
+ *     });
+ *   },
+ * });
  */
 export async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   options: Partial<RetryOptions> = {},
 ): Promise<T> {
+  // 每次重试延迟 = initialDelayMs * backoffMultiplier^attempt
+  // 上限 maxDelayMs，防止无限增长
   const opts: RetryOptions = { ...DEFAULT_RETRY_OPTIONS, ...options };
   let lastError: any;
 
@@ -182,18 +217,24 @@ export class HeartbeatManager {
    *
    * @param getProgress 获取当前进度的回调
    */
-  start(getProgress?: () => { executed: number; total: number; currentNode?: string }): void {
+  start(
+    getProgress?: () => {
+      executed: number;
+      total: number;
+      currentNode?: string;
+    },
+  ): void {
     if (!this.sseSubject || this.intervalMs <= 0) return;
 
     this.timer = setInterval(() => {
-      this.beatCount++;
+      this.beatCount++; // 心跳序号
       this.lastBeatTime = Date.now();
       const elapsed = this.lastBeatTime - this.startTime;
 
       const progress = getProgress?.();
 
       this.sseSubject?.next({
-        type: 'heartbeat',
+        type: "heartbeat",
         data: {
           beat: this.beatCount,
           elapsedMs: elapsed,
@@ -202,9 +243,10 @@ export class HeartbeatManager {
             progress: {
               executed: progress.executed,
               total: progress.total,
-              percentage: progress.total > 0
-                ? Math.round((progress.executed / progress.total) * 100)
-                : 0,
+              percentage:
+                progress.total > 0
+                  ? Math.round((progress.executed / progress.total) * 100)
+                  : 0,
               currentNode: progress.currentNode,
             },
           }),
